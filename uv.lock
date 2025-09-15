@@ -1,0 +1,23 @@
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "tinygrad"
+version = "0.11.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/74/e3bca9f8e361296c19bd2b038d0be8013a76b68a83757864b6751f0d592b/tinygrad-0.11.0.tar.gz", hash = "sha256:d9d468a55906cc49a1b4df5b69be78a58ab4d15714b7f238f2b0876d2bc09bc1", size = 1849541, upload-time = "2025-08-19T21:11:46.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/40/ac/38878fef46f9ce2cc4d624ac061f5bb5bb8ef98594fff96730d9947c3af0/tinygrad-0.11.0-py3-none-any.whl", hash = "sha256:b901d98880f04ad9f796734a013151ba851dbb9a340f1a516099adcd6fd3b3e3", size = 1745076, upload-time = "2025-08-19T21:11:44.723Z" },
+]
+
+[[package]]
+name = "tinyplayground"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "tinygrad" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "tinygrad", specifier = ">=0.11.0" }]
