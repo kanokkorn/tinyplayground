@@ -55,12 +55,12 @@ if __name__ == "__main__":
 
   state_dict = get_state_dict(model)
   try:
-    state_dict = safe_load('dqn.safetensors')
+    state_dict = safe_load('checkpoint.safetensors')
     load_state_dict(model, state_dict)
     print("checkpoint loaded..")
   except FileNotFoundError:
     print("checkpoint not found, creating new one..")
-    safe_save(state_dict, 'dqn.safetensors')
+    safe_save(state_dict, 'checkpoint.safetensors')
 
   opt = nn.optim.Adam(nn.state.get_parameters(model), lr=LEARNING_RATE)
 
@@ -135,4 +135,5 @@ if __name__ == "__main__":
 
   test_rew = evaluate(model, gym.make(ENVIRONMENT_NAME, render_mode='human'))
   print(f"test reward: {test_rew}")
-  safe_save(state_dict, 'dqn.safetensors')
+  print("training finished. output -> cartpole.safetensors")
+  safe_save(state_dict, 'cartpole.safetensors')
