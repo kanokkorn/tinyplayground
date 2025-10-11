@@ -5,9 +5,14 @@ import math
 import numpy as np
 
 from PIL import Image
-from tinygrad.tensor import Tensor
+from tinygrad import Device 
+from tinygrad import Tensor, TinyJit, nn
 from tinygrad.nn import BatchNorm2d, Conv2d
 from tinygrad.helpers import fetch
+from tinygrad.nn.state import safe_save, safe_load, get_state_dict, load_state_dict
+
+# hyperparams
+LEARNING_RATE = 0.03
 
 
 # stole from yolov3.py
@@ -181,5 +186,37 @@ class Darknet:
       outputs[i] = x
     return detections
 
+# parse from file instead of url
+def parse_cfg(cfg):
+  lines = cfg.decode("utf-8").split('\n')
+  lines = [x for x in lines if len(x) > 0]
+  lines = [x for x in lines if x[0] != '#']
+  lines = [x.rstrip().lstrip() for x in lines]
+  block, blocks = {}, []
+  for line in lines:
+    if line[0] == "[":
+      if len(block) != 0:
+        blocks.append(block)
+        block = {}
+      block["type"] = line[1:-1].rstrip()
+    else:
+      key,value = line.split("=")
+      block[key.rstrip()] = value.lstrip()
+  blocks.append(block)
+  return blocks
+
 if __name__ == "__main__":
-  main()
+  print(f"Setting up training environment. running on {Device.DEFAULT}")
+  cfg = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg').read_bytes()
+# cfg = open("yolov3.cfg", "rb")
+  model = Darknet(cfg) 
+  state_dict = get_state_dict(model)
+  try:
+    state_dict = safe_load('darknet-chkpt.safetensors')
+    load_state_dict(model, state_dict)
+    print("checkpoint loaded..")
+  except FileNotFoundError:
+    print("checkpoint not found, creating new one..")
+    safe_save(state_dict, 'darknet-chkpt.safetensors')
+  opt = nn.optim.Adam(nn.state.get_parameters(model), lr=LEARNING_RATE)
+
