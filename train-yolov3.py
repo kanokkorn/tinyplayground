@@ -1,25 +1,223 @@
+# YOLOv3 Training in tinygrad
+# Based on the provided inference code, extended for training.
+# Uses dummy data for demonstration. Replace with real data loader for actual training.
+# Loss is a basic implementation for positive samples only; enhance for negatives and ignore.
+
+# TODO: re-implement darknet with tinygrad
+#   - looking in train function at `yolo.c`(https://raw.githubusercontent.com/pjreddie/darknet/refs/heads/master/examples/yolo.c)  
+#   - parse and create conv base on `yolov3.cfg`
+#   - save weight file to .safetensor or .onnx format
+#   - this should be drop-in replacement of original YOLO `darknet` by pjreddie
+
+import argparse
 import sys
 import io
 import time
 import math
+import cv2
 import numpy as np
-
 from PIL import Image
-from tinygrad import Device 
-from tinygrad import Tensor, TinyJit, nn
+from tinygrad.tensor import Tensor
 from tinygrad.nn import BatchNorm2d, Conv2d
+from tinygrad.nn.optim import Adam
 from tinygrad.helpers import fetch
-from tinygrad.nn.state import safe_save, safe_load, get_state_dict, load_state_dict
+import random
 
-# hyperparams
-LEARNING_RATE = 0.03
+NUM_CLASSES = 80
+IMG_DIM = 416
+
+def show_labels(prediction, confidence=0.5, num_classes=80):
+  coco_labels = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names').read_bytes()
+  coco_labels = coco_labels.decode('utf-8').split('\n')
+  prediction = prediction.detach().numpy()
+  conf_mask = (prediction[:,:,4] > confidence)
+  prediction *= np.expand_dims(conf_mask, 2)
+  labels = []
+  # Iterate over batches
+  for img_pred in prediction:
+    max_conf = np.amax(img_pred[:,5:5+num_classes], axis=1)
+    max_conf_score = np.argmax(img_pred[:,5:5+num_classes], axis=1)
+    max_conf_score = np.expand_dims(max_conf_score, axis=1)
+    max_conf = np.expand_dims(max_conf, axis=1)
+    seq = (img_pred[:,:5], max_conf, max_conf_score)
+    image_pred = np.concatenate(seq, axis=1)
+    non_zero_ind = np.nonzero(image_pred[:,4])[0]
+    assert all(image_pred[non_zero_ind,0] > 0)
+    image_pred_ = np.reshape(image_pred[np.squeeze(non_zero_ind),:], (-1, 7))
+    classes, indexes = np.unique(image_pred_[:, -1], return_index=True)
+    for index, coco_class in enumerate(classes):
+      label, probability = coco_labels[int(coco_class)], image_pred_[indexes[index]][4] * 100
+      print(f"Detected {label} {probability:.2f}")
+      labels.append(label)
+  return labels
+
+def add_boxes(img, prediction):
+  if isinstance(prediction, int): # no predictions
+    return img
+  coco_labels = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names').read_bytes()
+  coco_labels = coco_labels.decode('utf-8').split('\n')
+  height, width = img.shape[0:2]
+  scale_factor = IMG_DIM / width
+  prediction[:,[1,3]] -= (IMG_DIM - scale_factor * width) / 2
+  prediction[:,[2,4]] -= (IMG_DIM - scale_factor * height) / 2
+  for pred in prediction:
+    corner1 = tuple(pred[1:3].astype(int))
+    corner2 = tuple(pred[3:5].astype(int))
+    w = corner2[0] - corner1[0]
+    h = corner2[1] - corner1[1]
+    corner2 = (corner2[0] + w, corner2[1] + h)
+    label = coco_labels[int(pred[-1])]
+    img = cv2.rectangle(img, corner1, corner2, (61, 217, 255), 3)
+    t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 1 , 1)[0]
+    c2 = corner1[0] + t_size[0] + 3, corner1[1] + t_size[1] + 4
+    img = cv2.rectangle(img, corner1, c2, (61, 217, 255), -1)
+    img = cv2.putText(img, label, (corner1[0], corner1[1] + t_size[1]), cv2.FONT_HERSHEY_DUPLEX, 1, [0, 0, 0], 2)
+  return img
+
+def bbox_iou(box1, box2):
+  """
+  Returns the IoU of two bounding boxes
+  """
+  # Get the coordinates of bounding boxes
+  b1_x1, b1_y1, b1_x2, b1_y2 = box1[:,0], box1[:,1], box1[:,2], box1[:,3]
+  b2_x1, b2_y1, b2_x2, b2_y2 = box2[:,0], box2[:,1], box2[:,2], box2[:,3]
+  # get the coordinates of the intersection rectangle
+  inter_rect_x1 = np.maximum(b1_x1, b2_x1)
+  inter_rect_y1 = np.maximum(b1_y1, b2_y1)
+  inter_rect_x2 = np.minimum(b1_x2, b2_x2)
+  inter_rect_y2 = np.minimum(b1_y2, b2_y2)
+  #Intersection area
+  inter_area = np.clip(inter_rect_x2 - inter_rect_x1 + 1, 0, 99999) * np.clip(inter_rect_y2 - inter_rect_y1 + 1, 0, 99999)
+  #Union Area
+  b1_area = (b1_x2 - b1_x1 + 1)*(b1_y2 - b1_y1 + 1)
+  b2_area = (b2_x2 - b2_x1 + 1)*(b2_y2 - b2_y1 + 1)
+  iou = inter_area / (b1_area + b2_area - inter_area)
+  return iou
+
+def process_results(prediction, confidence=0.5, num_classes=80, nms_conf=0.4):
+  prediction = prediction.detach().numpy()
+  conf_mask = (prediction[:,:,4] > confidence)
+  conf_mask = np.expand_dims(conf_mask, 2)
+  prediction = prediction * conf_mask
+  # Non max suppression
+  box_corner = prediction
+  box_corner[:,:,0] = (prediction[:,:,0] - prediction[:,:,2]/2)
+  box_corner[:,:,1] = (prediction[:,:,1] - prediction[:,:,3]/2)
+  box_corner[:,:,2] = (prediction[:,:,0] + prediction[:,:,2]/2)
+  box_corner[:,:,3] = (prediction[:,:,1] + prediction[:,:,3]/2)
+  prediction[:,:,:4] = box_corner[:,:,:4]
+  write = False
+  # Process img
+  img_pred = prediction[0]
+  max_conf = np.amax(img_pred[:,5:5+num_classes], axis=1)
+  max_conf_score = np.argmax(img_pred[:,5:5+num_classes], axis=1)
+  max_conf_score = np.expand_dims(max_conf_score, axis=1)
+  max_conf = np.expand_dims(max_conf, axis=1)
+  seq = (img_pred[:,:5], max_conf, max_conf_score)
+  image_pred = np.concatenate(seq, axis=1)
+  non_zero_ind = np.nonzero(image_pred[:,4])[0]
+  assert all(image_pred[non_zero_ind,0] > 0)
+  image_pred_ = np.reshape(image_pred[np.squeeze(non_zero_ind),:], (-1, 7))
+  if image_pred_.shape[0] == 0:
+    print("No detections found!")
+    return 0
+  for cls in np.unique(image_pred_[:, -1]):
+    # perform NMS, get the detections with one particular class
+    cls_mask = image_pred_*np.expand_dims(image_pred_[:, -1] == cls, axis=1)
+    class_mask_ind = np.squeeze(np.nonzero(cls_mask[:,-2]))
+    # class_mask_ind = np.nonzero()
+    image_pred_class = np.reshape(image_pred_[class_mask_ind], (-1, 7))
+    # sort the detections such that the entry with the maximum objectness
+    # confidence is at the top
+    conf_sort_index = np.argsort(image_pred_class[:,4])
+    image_pred_class = image_pred_class[conf_sort_index]
+    for i in range(image_pred_class.shape[0]):
+      # Get the IOUs of all boxes that come after the one we are looking at in the loop
+      try:
+        ious = bbox_iou(np.expand_dims(image_pred_class[i], axis=0), image_pred_class[i+1:])
+      except:
+        break
+      # Zero out all the detections that have IoU > threshold
+      iou_mask = np.expand_dims((ious < nms_conf), axis=1)
+      image_pred_class[i+1:] *= iou_mask
+      # Remove the non-zero entries
+      non_zero_ind = np.squeeze(np.nonzero(image_pred_class[:,4]))
+      image_pred_class = np.reshape(image_pred_class[non_zero_ind], (-1, 7))
+    batch_ind = np.array([[0]])
+    seq = (batch_ind, image_pred_class)
+    if not write:
+      output, write = np.concatenate(seq, axis=1), True
+    else:
+      out = np.concatenate(seq, axis=1)
+      output = np.concatenate((output,out))
+  return output
+
+def infer(model, img):
+  img = np.array(Image.fromarray(img).resize((IMG_DIM, IMG_DIM)))
+  img = img[:,:,::-1].transpose((2,0,1))
+  img = img[np.newaxis,:,:,:]/255.0
+  prediction = model.forward(Tensor(img.astype(np.float32)))
+  return prediction
 
 
-# stole from yolov3.py
+def parse_cfg(cfg):
+  # Return a list of blocks
+  lines = cfg.decode("utf-8").split('\n')
+  lines = [x for x in lines if len(x) > 0]
+  lines = [x for x in lines if x[0] != '#']
+  lines = [x.rstrip().lstrip() for x in lines]
+  block, blocks = {}, []
+  for line in lines:
+    if line[0] == "[":
+      if len(block) != 0:
+        blocks.append(block)
+        block = {}
+      block["type"] = line[1:-1].rstrip()
+    else:
+      key,value = line.split("=")
+      block[key.rstrip()] = value.lstrip()
+  blocks.append(block)
+  return blocks
+
+# TODO: Speed up this function, avoid copying stuff from GPU to CPU
+def predict_transform(prediction, inp_dim, anchors, num_classes):
+  batch_size = prediction.shape[0]
+  stride = inp_dim // prediction.shape[2]
+  grid_size = inp_dim // stride
+  bbox_attrs = 5 + num_classes
+  num_anchors = len(anchors)
+  prediction = prediction.reshape(shape=(batch_size, bbox_attrs*num_anchors, grid_size*grid_size))
+  prediction = prediction.transpose(1, 2)
+  prediction = prediction.reshape(shape=(batch_size, grid_size*grid_size*num_anchors, bbox_attrs))
+  prediction_cpu = prediction.numpy()
+  for i in (0, 1, 4):
+    prediction_cpu[:,:,i] = 1 / (1 + np.exp(-prediction_cpu[:,:,i]))
+  # Add the center offsets
+  grid = np.arange(grid_size)
+  a, b = np.meshgrid(grid, grid)
+  x_offset = a.reshape((-1, 1))
+  y_offset = b.reshape((-1, 1))
+  x_y_offset = np.concatenate((x_offset, y_offset), 1)
+  x_y_offset = np.tile(x_y_offset, (1, num_anchors))
+  x_y_offset = x_y_offset.reshape((-1,2))
+  x_y_offset = np.expand_dims(x_y_offset, 0)
+  anchors = [(a[0]/stride, a[1]/stride) for a in anchors]
+  anchors = np.tile(anchors, (grid_size*grid_size, 1))
+  anchors = np.expand_dims(anchors, 0)
+  prediction_cpu[:,:,:2] += x_y_offset
+  prediction_cpu[:,:,2:4] = np.exp(prediction_cpu[:,:,2:4])*anchors
+  prediction_cpu[:,:,5:5+num_classes] = 1 / (1 + np.exp(-prediction_cpu[:,:,5:5+num_classes]))
+  prediction_cpu[:,:,:4] *= stride
+  return Tensor(prediction_cpu)
+
+
 class Darknet:
   def __init__(self, cfg):
     self.blocks = parse_cfg(cfg)
+    self.anchors_per_scale = []
     self.net_info, self.module_list = self.create_modules(self.blocks)
+    self.training = False
+    self.num_classes = int(self.blocks[-1]["classes"])
     print("Modules length:", len(self.module_list))
 
   def create_modules(self, blocks):
@@ -75,13 +273,42 @@ class Darknet:
         mask = list(map(int, x["mask"].split(",")))
         anchors = [int(a) for a in x["anchors"].split(",")]
         anchors = [(anchors[i], anchors[i+1]) for i in range(0, len(anchors), 2)]
-        module.append([anchors[i] for i in mask])
+        masked_anchors = [anchors[i] for i in mask]
+        module.append(masked_anchors)
+        self.anchors_per_scale.append(masked_anchors)
       # Append to module_list
       module_list.append(module)
       if filters is not None:
         prev_filters = filters
       output_filters.append(filters)
     return (net_info, module_list)
+
+  def parameters(self):
+    params = []
+    for module in self.module_list:
+      for layer in module:
+        if hasattr(layer, 'weight'):
+          params.append(layer.weight)
+        if hasattr(layer, 'bias') and layer.bias is not None:
+          params.append(layer.bias)
+        if isinstance(layer, BatchNorm2d):
+          params.append(layer.weight)
+          params.append(layer.bias)
+    return params
+
+  def train(self):
+    self.training = True
+    for module in self.module_list:
+      for layer in module:
+        if isinstance(layer, BatchNorm2d):
+          layer.training = True
+
+  def eval(self):
+    self.training = False
+    for module in self.module_list:
+      for layer in module:
+        if isinstance(layer, BatchNorm2d):
+          layer.training = False
 
   def dump_weights(self):
     for i in range(len(self.module_list)):
@@ -129,10 +356,10 @@ class Darknet:
           bn_running_mean = bn_running_mean.reshape(shape=tuple(bn.running_mean.shape))
           bn_running_var = bn_running_var.reshape(shape=tuple(bn.running_var.shape))
           # Copy data
-          bn.bias = bn_biases
-          bn.weight = bn_weights
-          bn.running_mean = bn_running_mean
-          bn.running_var = bn_running_var
+          bn.bias.assign(bn_biases)
+          bn.weight.assign(bn_weights)
+          bn.running_mean.assign(bn_running_mean)
+          bn.running_var.assign(bn_running_var)
         else:
           # load biases of the conv layer
           num_biases = math.prod(conv.bias.shape)
@@ -142,18 +369,19 @@ class Darknet:
           # Reshape
           conv_biases = conv_biases.reshape(shape=tuple(conv.bias.shape))
           # Copy
-          conv.bias = conv_biases
+          conv.bias.assign(conv_biases)
         # Load weighys for conv layers
         num_weights = math.prod(conv.weight.shape)
         conv_weights = Tensor(weights[ptr:ptr+num_weights].astype(np.float32))
         ptr += num_weights
         conv_weights = conv_weights.reshape(shape=tuple(conv.weight.shape))
-        conv.weight = conv_weights
+        conv.weight.assign(conv_weights)
 
   def forward(self, x):
     modules = self.blocks[1:]
     outputs = {} # Cached outputs for route layer
     detections, write = None, False
+    yolo_outputs = []
     for i, module in enumerate(modules):
       module_type = (module["type"])
       if module_type == "convolutional" or module_type == "upsample":
@@ -161,7 +389,7 @@ class Darknet:
           x = layer(x)
       elif module_type == "route":
         layers = module["layers"]
-        layers = [int(a) for a in layers]
+        layers = [int(a) for a in layers.split(",")]
         if (layers[0]) > 0:
           layers[0] = layers[0] - i
         if len(layers) == 1:
@@ -178,45 +406,186 @@ class Darknet:
         anchors = self.module_list[i][0]
         inp_dim = int(self.net_info["height"])  # 416
         num_classes = int(module["classes"])
-        x = predict_transform(x, inp_dim, anchors, num_classes)
-        if not write:
-          detections, write = x, True
+        if self.training:
+          yolo_outputs.append(x)
         else:
-          detections = Tensor(np.concatenate((detections.numpy(), x.numpy()), axis=1))
+          x = predict_transform(x, inp_dim, anchors, num_classes)
+          if not write:
+            detections, write = x, True
+          else:
+            detections = Tensor(np.concatenate((detections.numpy(), x.numpy()), axis=1))
       outputs[i] = x
+    if self.training:
+      return yolo_outputs
     return detections
 
-# parse from file instead of url
-def parse_cfg(cfg):
-  lines = cfg.decode("utf-8").split('\n')
-  lines = [x for x in lines if len(x) > 0]
-  lines = [x for x in lines if x[0] != '#']
-  lines = [x.rstrip().lstrip() for x in lines]
-  block, blocks = {}, []
-  for line in lines:
-    if line[0] == "[":
-      if len(block) != 0:
-        blocks.append(block)
-        block = {}
-      block["type"] = line[1:-1].rstrip()
-    else:
-      key,value = line.split("=")
-      block[key.rstrip()] = value.lstrip()
-  blocks.append(block)
-  return blocks
+  def __call__(self, x):
+    return self.forward(x)
+
+def dummy_batch(batch_size=1):
+  img = Tensor.rand(batch_size, 3, IMG_DIM, IMG_DIM)
+  targets = [[] for _ in range(batch_size)]
+  for b in range(batch_size):
+    num_gt = random.randint(1, 10)
+    for _ in range(num_gt):
+      cls = random.randint(0, NUM_CLASSES - 1)
+      cx = random.random()
+      cy = random.random()
+      w = random.random() * 0.5 + 0.05
+      h = random.random() * 0.5 + 0.05
+      targets[b].append((cls, cx, cy, w, h))
+  return img, targets
+
+def yolo_loss(model, yolo_outputs, targets, img_dim=IMG_DIM):
+  batch_size = yolo_outputs[0].shape[0]
+  total_loss = Tensor.zeros(1)
+  scales = [32, 16, 8]
+  grid_sizes = [img_dim // s for s in scales]
+  anchors_per_scale = model.anchors_per_scale
+  num_classes = model.num_classes
+  num_scales = len(yolo_outputs)
+  for si in range(num_scales):
+    out = yolo_outputs[si]
+    b, ch, gh, gw = out.shape
+    out = out.permute(0, 2, 3, 1).reshape(b, gh, gw, 3, 5 + num_classes)
+    stride = scales[si]
+    scale_anchors = anchors_per_scale[si]
+    grid_size = grid_sizes[si]
+    for b_i in range(batch_size):
+      pred = out[b_i]
+      gt_boxes = targets[b_i]
+      for gt in gt_boxes:
+        cls, cx, cy, w, h = gt
+        cx_pixel = cx * img_dim
+        cy_pixel = cy * img_dim
+        w_pixel = w * img_dim
+        h_pixel = h * img_dim
+        # Find best anchor based on size similarity
+        best_anchor = 0
+        best_iou = 0
+        for a in range(3):
+          aw = scale_anchors[a][0] * stride
+          ah = scale_anchors[a][1] * stride
+          iw = min(w_pixel, aw) / max(w_pixel, aw)
+          ih = min(h_pixel, ah) / max(h_pixel, ah)
+          iou_anchor = iw * ih
+          if iou_anchor > best_iou:
+            best_iou = iou_anchor
+            best_anchor = a
+        # Find grid cell
+        grid_x = math.floor(cx_pixel / stride)
+        grid_y = math.floor(cy_pixel / stride)
+        if 0 <= grid_x < grid_size and 0 <= grid_y < grid_size:
+          # Targets for coord (raw)
+          tx = cx_pixel / stride - grid_x
+          ty = cy_pixel / stride - grid_y
+          tw = math.log(w_pixel / (scale_anchors[best_anchor][0] * stride))
+          th = math.log(h_pixel / (scale_anchors[best_anchor][1] * stride))
+          # Raw pred
+          raw_pred = pred[grid_y, grid_x, best_anchor]
+          # Coord loss (MSE on raw)
+          coord_loss = (raw_pred[0] - tx)**2 + (raw_pred[1] - ty)**2 + (raw_pred[2] - tw)**2 + (raw_pred[3] - th)**2
+          total_loss += coord_loss
+          # Obj loss
+          obj_loss = (raw_pred[4] - 1.0)**2
+          total_loss += obj_loss
+          # Class loss (MSE, one-hot)
+          target_cls = Tensor.zeros(num_classes)
+          target_cls[cls] = 1.0
+          cls_loss = (raw_pred[5:] - target_cls).pow(2).sum()
+          total_loss += cls_loss
+  # Normalize roughly
+  total_loss = total_loss / (batch_size * 3 * 10)  # arbitrary
+  return total_loss
+
+def train(num_epochs=1, batch_size=1, steps_per_epoch=10):
+  cfg = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg').read_bytes()
+  model = Darknet(cfg)
+  # Optionally load pretrained: model.load_weights('https://pjreddie.com/media/files/yolov3.weights')
+  optimizer = Adam(model.parameters(), lr=0.001)
+  model.train()
+  for epoch in range(num_epochs):
+    for step in range(steps_per_epoch):
+      imgs, targets = dummy_batch(batch_size)
+      preds = model(imgs)
+      loss = yolo_loss(model, preds, targets)
+      optimizer.zero_grad()
+      loss.backward()
+      optimizer.step()
+      print(f"Epoch {epoch}, Step {step}, Loss: {loss.numpy()[0]:.4f}")
+
 
 if __name__ == "__main__":
-  print(f"Setting up training environment. running on {Device.DEFAULT}")
-  cfg = fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg').read_bytes()
-# cfg = open("yolov3.cfg", "rb")
-  model = Darknet(cfg) 
-  state_dict = get_state_dict(model)
-  try:
-    state_dict = safe_load('darknet-chkpt.safetensors')
-    load_state_dict(model, state_dict)
-    print("checkpoint loaded..")
-  except FileNotFoundError:
-    print("checkpoint not found, creating new one..")
-    safe_save(state_dict, 'darknet-chkpt.safetensors')
-  opt = nn.optim.Adam(nn.state.get_parameters(model), lr=LEARNING_RATE)
+  parser = argparse.ArgumentParser(description="darknet reimpementation with tinygrad")
+  subparsers = parser.add_subparsers(dest="command", help="Main commands")
 
+  train_parser = subparsers.add_parser("train", help="train yolo model")
+  train_parser.add_argument("--data", type=str, required=True, help="path to .data")
+
+  detect_parser = subparsers.add_parser("detect", help="Run detector")
+  detect_subparsers = detect_parser.add_subparsers(dest="source", help="detect source")
+
+  image_parser = detect_subparsers.add_parser("image", help="Detect an image")
+  image_parser.add_argument("--path", type=str, required=True, help="path to an image")
+
+  video_parser = detect_subparsers.add_parser("video", help="Detect an video")
+  video_parser.add_argument("--path", type=str, required=True, help="path to a video")
+  video_parser.add_argument("--fps", type=str, required=True, help="processing FPS")
+
+  args = parser.parse_args()
+
+  if args.command == "train":
+    print(f"training using {args.data}")
+
+  elif args.command == "detect":
+    if args.source == "image":
+      print(f"detect object in image: {arg.path}")
+    if args.source == "video":
+      print(f"detect object in video: {arg.path} at {arg.fps}")
+    else:
+      detect_parser.print_help()
+  else:
+    parser.print_help()
+    
+
+# this one is for inference 
+# if __name__ == "__main__":
+#   if len(sys.argv) > 1 and sys.argv[1] == 'train':
+#     train(num_epochs=1, batch_size=1, steps_per_epoch=5)  # Short run for testing
+#   else:
+#     model = Darknet(fetch('https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg').read_bytes())
+#     print("Loading weights file (237MB). This might take a while…")
+#     model.load_weights('https://pjreddie.com/media/files/yolov3.weights')
+#     model.eval()
+#     if len(sys.argv) > 1:
+#       url = sys.argv[1]
+#     else:
+#       url = "https://github.com/ayooshkathuria/pytorch-yolo-v3/raw/master/dog-cycle-car.png"
+#     if url == 'webcam':
+#       cap = cv2.VideoCapture(0)
+#       cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+#       while 1:
+#         _ = cap.grab() # discard one frame to circumvent capture buffering
+#         ret, frame = cap.read()
+#         prediction = process_results(infer(model, frame))
+#         img = Image.fromarray(frame[:, :, [2,1,0]])
+#         boxes = add_boxes(np.array(img.resize((IMG_DIM, IMG_DIM))), prediction)
+#         boxes = cv2.cvtColor(boxes, cv2.COLOR_RGB2BGR)
+#         cv2.imshow('yolo', boxes)
+#         if cv2.waitKey(1) & 0xFF == ord('q'):
+#           break
+#       cap.release()
+#       cv2.destroyAllWindows()
+#     elif url.startswith('http'):
+#       img_stream = io.BytesIO(fetch(url).read_bytes())
+#       img = cv2.imdecode(np.frombuffer(img_stream.read(), np.uint8), 1)
+#     else:
+#       img = cv2.imread(url)
+#     st = time.time()
+#     print('running inference…')
+#     prediction = infer(model, img)
+#     print(f'did inference in {(time.time() - st):2f}s')
+#     show_labels(prediction)
+#     prediction = process_results(prediction)
+#     boxes = add_boxes(np.array(Image.fromarray(img).resize((IMG_DIM, IMG_DIM))), prediction)
+#     cv2.imwrite('boxes.jpg', boxes)
