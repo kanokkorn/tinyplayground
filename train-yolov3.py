@@ -515,6 +515,19 @@ def train(num_epochs=1, batch_size=1, steps_per_epoch=10):
       print(f"Epoch {epoch}, Step {step}, Loss: {loss.numpy()[0]:.4f}")
 
 
+def parse_cfg(cfgfile : str):
+  data = {}
+  with open(cfgfile, "r") as cfgcontent:
+    for line in cfgcontent:
+      line = line.strip()
+      if not line or line.startswith('#'):
+        continue
+      if '=' in line:
+        key, value = line.split('=', 1)
+        data[key.strip()] = value.strip()
+  return data
+
+
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description="darknet reimpementation with tinygrad")
   subparsers = parser.add_subparsers(dest="command", help="Main commands")
@@ -536,6 +549,12 @@ if __name__ == "__main__":
 
   if args.command == "train":
     print(f"training using {args.data}")
+    config = parse_cfg(f"{args.data}")
+    classes = config.get('classes')
+    train_path = config.get('train')
+    print(classes)
+    print(train_path)
+    train()
 
   elif args.command == "detect":
     if args.source == "image":
