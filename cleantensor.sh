@@ -1,3 +1,4 @@
 #!/bin/sh
 # clear weight in safetensor
-rm -rf *.safetensors
+
+find . -name "*.safetensors" -type f -delete
